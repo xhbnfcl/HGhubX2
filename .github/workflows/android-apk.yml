@@ -1,0 +1,229 @@
+name: Android APK
+run-name: "Android APK · ${{ github.event_name == 'workflow_dispatch' && inputs.abi || github.ref_name }}"
+
+# 手机版 Android APK 流水线：产出一个可以直接装到普通安卓手机上的分包 APK。
+#
+# 与 .github/workflows/release.yml 的 android 任务的区别：
+#   1. 独立运行，不依赖 preflight / 发布说明 / 版本号改写，可在 fork 里单独点按钮；
+#   2. 没有配置签名 Secrets 时也能出包（自动生成一次性密钥），先跑通再补正式签名；
+#   3. 产物总是上传为 Actions artifact，推 v* tag 时才额外挂到 GitHub Release。
+#
+# 背景：`src-tauri/gen/` 不入库，CI 每次都会重新 `tauri android init` 生成 Android 工程；
+# 生成后由 tauri.conf.json 的 beforeBuildCommand 调用 patch-android-splash.mjs（启动背景
+# 与系统栏/安全区桥接）和 sync-android-icons.mjs（图标），因此这里的原生工程与本地一致。
+#
+# 想换成稳定签名（同签名的包可覆盖升级）时，在仓库 Secrets 里加这 4 个值：
+#   ANDROID_KEY_BASE64 / ANDROID_KEY_ALIAS / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_PASSWORD
+# 生成方式见工作流末尾说明。
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "要打包的 ABI（arm64-armv7 覆盖几乎全部手机）"
+        type: choice
+        default: arm64-armv7
+        options:
+          - arm64-armv7
+          - arm64
+          - all
+      quick:
+        description: "快速编译（thin LTO + 4 个 codegen 单元，体积略大但明显更快）"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  apk:
+    name: Build phone APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    env:
+      # 与 release.yml 的 quick 逻辑一致；push 事件下视为 quick。
+      CARGO_PROFILE_RELEASE_LTO: ${{ (github.event_name != 'workflow_dispatch' || inputs.quick) && 'thin' || 'true' }}
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ (github.event_name != 'workflow_dispatch' || inputs.quick) && '4' || '1' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 22 + pnpm 10 + `pnpm install --frozen-lockfile`
+      - uses: ./.github/actions/setup-node-pnpm
+
+      # JDK 17 + Android SDK 36 + Build-Tools 36.0.0 + NDK 28.2.13676358
+      # 并写入 ANDROID_HOME / ANDROID_SDK_ROOT / NDK_HOME
+      - uses: ./.github/actions/setup-android-sdk
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: swatinem/rust-cache@v2.9.3
+        continue-on-error: true
+        timeout-minutes: 8
+        with:
+          workspaces: src-tauri -> target
+          key: android-apk
+
+      - name: 读取版本号
+        id: meta
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          VC="$(node -p "require('./src-tauri/tauri.conf.json').bundle.android.versionCode")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "::notice::HGhubX $V（versionCode $VC）"
+
+      # src-tauri/gen/android 不入库，这里现生成；失败一般是缺 SDK/NDK 或 Java 版本不对。
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK（按 ABI 分包）
+        env:
+          ABI: ${{ github.event_name == 'workflow_dispatch' && inputs.abi || 'arm64-armv7' }}
+        run: |
+          set -euo pipefail
+          case "$ABI" in
+            arm64) TARGETS="aarch64" ;;
+            all)   TARGETS="aarch64 armv7 x86_64 i686" ;;
+            *)     TARGETS="aarch64 armv7" ;;
+          esac
+          echo "targets: $TARGETS"
+          pnpm tauri android build --apk --split-per-abi --target $TARGETS
+
+      # Gradle 出来的 release APK 没有签名（模板里 release 没有 signingConfig），
+      # 必须自己签名才能安装。优先用 Secrets 里的正式密钥，没有就现场生成一个。
+      - name: 对齐 + 签名 APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          APK_ROOT="src-tauri/gen/android/app/build/outputs/apk"
+          if [ ! -d "$APK_ROOT" ]; then
+            echo "::error::Gradle 没有产出 $APK_ROOT，检查上一步日志"; exit 1
+          fi
+
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$BT/zipalign"
+          KS="$RUNNER_TEMP/signing.keystore"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            echo "::notice::使用仓库 Secrets 中的正式签名密钥，同签名的 APK 可直接覆盖升级"
+          else
+            KEY_ALIAS="hghubx-ci"
+            STORE_PASSWORD="hghubx-ci"
+            KEY_PASSWORD="hghubx-ci"
+            keytool -genkeypair -noprompt -keystore "$KS" -storetype PKCS12 \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -dname "CN=HGhubX CI, O=HGhubX, C=CN" >/dev/null
+            echo "::warning::未配置 ANDROID_KEY_* Secrets，本次使用一次性签名密钥；下次构建签名会变，安装前要先卸载旧版。"
+          fi
+
+          mkdir -p artifacts
+          found=0
+          while IFS= read -r f; do
+            abi="$(basename "$(dirname "$(dirname "$f")")")"
+            case "$abi" in
+              arm64) label="arm64-v8a" ;;
+              armv7) label="armeabi-v7a" ;;
+              i686)  label="x86" ;;
+              *)     label="$abi" ;;
+            esac
+            aligned="$RUNNER_TEMP/aligned-$label.apk"
+            if ! "$ZIPALIGN" -p -f 4 "$f" "$aligned" >/dev/null 2>&1; then
+              echo "::warning::$(basename "$f") 无法 zipalign，直接对原文件签名"
+              aligned="$f"
+            fi
+            out="artifacts/HGhubX_${VERSION}_${label}.apk"
+            "$APKSIGNER" sign \
+              --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
+              --v4-signing-enabled false \
+              --out "$out" "$aligned"
+            "$APKSIGNER" verify --print-certs "$out" | grep -E "certificate DN|Verified using" || true
+            found=$((found + 1))
+          done < <(find "$APK_ROOT" -name '*-release*.apk')
+
+          rm -f "$KS"
+          if [ "$found" -eq 0 ]; then echo "::error::没有找到 release APK"; exit 1; fi
+
+          # 打印包名 / 版本 / minSdk，便于确认装的上（minSdk 24 = Android 7.0 起）。
+          AAPT2="$(ls "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 | sort -V | tail -1)"
+          for a in artifacts/*.apk; do
+            "$AAPT2" dump badging "$a" | grep -E "^(package|sdkVersion|targetSdkVersion):" || true
+          done
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: artifacts/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 写入任务摘要
+        run: |
+          {
+            echo "### Android APK"
+            echo ""
+            echo "| 文件 | 大小 |"
+            echo "| --- | --- |"
+            for a in artifacts/*.apk; do
+              echo "| $(basename "$a") | $(du -h "$a" | cut -f1) |"
+            done
+            echo ""
+            echo "在本次运行的 Artifacts 区下载 \`android-apk\`，解压后把 APK 传到手机安装（需允许「未知来源 / 安装未知应用」）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Attach APK to GitHub Release
+    needs: [apk]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-apk
+          path: artifacts
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: HGhubX ${{ github.ref_name }}
+          files: artifacts/*.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+# 想让签名固定下来（同签名的 APK 可覆盖升级、不丢数据）时，本机执行一次：
+#
+#   keytool -genkeypair -v -keystore hghubx-release.jks -storetype PKCS12 \
+#     -alias hghubx -keyalg RSA -keysize 2048 -validity 10000
+#   # 然后按仓库 Secrets 填 4 个值（Windows PowerShell）：
+#   [Convert]::ToBase64String([IO.File]::ReadAllBytes("hghubx-release.jks")) > keystore.b64
+#
+#   ANDROID_KEY_BASE64           <- keystore.b64 的全部内容（单行）
+#   ANDROID_KEY_ALIAS            <- hghubx
+#   ANDROID_KEYSTORE_PASSWORD    <- 生成时输入的 store 密码
+#   ANDROID_KEY_PASSWORD         <- 生成时输入的 key 密码（PKCS12 下与 store 密码相同）
+#
+# 私钥文件不要提交进仓库（.gitignore 已忽略 *.jks / *.keystore），丢了就无法覆盖升级。
